@@ -1,18 +1,24 @@
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import PowerTransformer
 from sentence_transformers import SentenceTransformer
+import hashlib
 import torch
 import numpy as np
 import pandas as pd
 import re
+import os
 
 
-def preprocess(df, is_train=True, scaler=None, text_pcas=None):
+def preprocess(df, is_train=True, scaler=None, text_pcas=None, train_cols=None):
 
     # Lower Case
     string_cols = df.select_dtypes(include=['object', 'string']).columns
     for col in string_cols:
-        df[col] = df[col].astype(str).str.lower()
+        df[col] = df[col].apply(lambda x: str(x).lower() if pd.notna(x) else x)
+
+        dropped = df[col].dropna()
+        if len(dropped) > 0 and set(dropped.unique()).issubset({'true', 'false'}):
+            df[col] = df[col].map({'true': 1, 'false': 0})
 
     # Drop Response Identification Columns
     df.drop(columns=["QueryID", "ResponseID", "QueryName", "ResponseName"], inplace=True)
@@ -48,6 +54,15 @@ def preprocess(df, is_train=True, scaler=None, text_pcas=None):
     for col in link_cols:
         df[col] = (df[col].replace(r'^\s*$', np.nan, regex=True).notna().astype(int))
 
+    # Calculate Text Columns length
+    all_text_cols = ['AboutText', 'ShortDescrip', 'DetailedDescrip', 'Reviews',
+                     'PCMinReqsText', 'PCRecReqsText', 'LinuxMinReqsText',
+                     'LinuxRecReqsText', 'MacMinReqsText', 'MacRecReqsText']
+
+    for col in all_text_cols:
+        if col in df.columns:
+            df[f'{col}_Length'] = df[col].replace('nan', '').fillna('').astype(str).str.len()
+
     # Preprocessing Text using NLP Model (all-MiniLM-L6-v2)
     text_cols_to_embed = ['AboutText', 'ShortDescrip', 'DetailedDescrip', 'Reviews', ]
     df, text_pcas = text_embedding(df, text_cols_to_embed, is_train, text_pcas)
@@ -64,35 +79,79 @@ def preprocess(df, is_train=True, scaler=None, text_pcas=None):
     # Processing Different Systems Min and Recommend Requirement
     df = process_system_requirements(df)
 
+    arithmetic_cols = [
+        'ScreenshotCount', 'MovieCount', 'DLCCount',
+        'PlatformWindows', 'PlatformLinux', 'PlatformMac',
+        'DeveloperCount', 'PublisherCount',
+        'PriceFinal', 'PriceInitial',
+        'SteamSpyOwners'
+    ]
+
+    for col in arithmetic_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    df[arithmetic_cols] = df[arithmetic_cols].fillna(0)
+
     # Feature Engineering
     df['Game_age'] = 2026 - df['ReleaseYear']
     df['New_game'] = (df['Game_age'] < 3).astype(int)
     df['Old_game'] = (df['Game_age'] > 10).astype(int)
-    df['Players_per_Owner'] = df['SteamSpyPlayersEstimate'] / (df['SteamSpyOwners'] + 1)
     df['ContentTotal'] = df['ScreenshotCount'] + df['MovieCount'] + df['DLCCount']
+
+    # New Feature Engineering
+    df['Content_to_Price_Ratio'] = df['ContentTotal'] / (df['PriceFinal'] + 0.01)
+    df['Language_to_Price_Ratio'] = df['LanguageCount'] / (df['PriceFinal'] + 0.01)
+    df['Owner_Base_Pace'] = df['SteamSpyOwners'] / (df['Game_age'] + 1)
+    if 'PCMinReqsText_Processor_GHz' in df.columns:
+        df['Hardware_Tax'] = df['PCMinReqsText_Processor_GHz'] / (df['PriceFinal'] + 0.01)
+    df['Dev_to_Pub_Ratio'] = df['DeveloperCount'] / (df['PublisherCount'] + 0.01)
+    df['Is_Discounted'] = (df['PriceInitial'] > df['PriceFinal']).astype(int)
+    df['Discount_Amount'] = df['PriceInitial'] - df['PriceFinal']
+    df['Platform_Count'] = df['PlatformWindows'] + df['PlatformLinux'] + df['PlatformMac']
+    df['Discount_Percentage'] = df['Discount_Amount'] / (df['PriceInitial'] + 0.01)
+
+    if all(c in df.columns for c in ['PlatformWindows', 'PlatformLinux', 'PlatformMac']):
+        df['Platform_Count'] = df['PlatformWindows'] + df['PlatformLinux'] + df['PlatformMac']
+
+    genre_cols = [c for c in df.columns if c.startswith('GenreIs')]
+    df['GenreCount'] = df[genre_cols].sum(axis=1)
 
     # Fill Null values using Median
     df = fill_na(df)
 
     # Power Transform all values to solve Skewness
-    continuous_cols = df.select_dtypes(include=['number']).columns
-
     if is_train:
-        scaler = PowerTransformer(method='yeo-johnson')
-        df[continuous_cols] = pd.DataFrame(
-            scaler.fit_transform(df[continuous_cols]),
-            columns=continuous_cols,
-            index=df.index
-        )
+        continuous_cols = df.select_dtypes(include=['number']).columns
+        continuous_cols = [c for c in continuous_cols if df[c].nunique() > 2]
 
-        return df, scaler, text_pcas
+        scaler = PowerTransformer(method='yeo-johnson')
+        df[continuous_cols] = scaler.fit_transform(df[continuous_cols])
+        train_cols = df.columns.tolist()
+
+        return df, scaler, text_pcas, train_cols
 
     else:
-        if scaler is None:
-            raise ValueError("You must pass a fitted 'scaler' object when is_train=False")
-        df[continuous_cols] = scaler.transform(df[continuous_cols])
+        if train_cols is not None:
+            missing_cols = set(train_cols) - set(df.columns)
+            for col in missing_cols:
+                df[col] = 0
+
+            extra_cols = set(df.columns) - set(train_cols)
+            df.drop(columns=extra_cols, inplace=True, errors='ignore')
+            df = df[train_cols]
+
+        if scaler is not None:
+            train_continuous_cols = scaler.feature_names_in_.tolist()
+            cols_to_scale = [c for c in train_continuous_cols if c in df.columns]
+            df[cols_to_scale] = scaler.transform(df[cols_to_scale])
 
         return df
+
+
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+embedder = SentenceTransformer('all-MiniLM-L6-v2', device=device, local_files_only=True)
 
 
 def drop_unnecessary_rows(df):
@@ -106,11 +165,13 @@ def drop_unnecessary_rows(df):
     return df
 
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-embedder = SentenceTransformer('all-MiniLM-L6-v2', device=device)
+
+def get_data_fingerprint(series):
+    combined_text = "".join(series.fillna('').astype(str).tolist())
+    return hashlib.md5(combined_text.encode('utf-8')).hexdigest()[:8]
 
 
-def text_embedding(df, text_cols, is_train=True, text_pcas=None, n_components=5):
+def text_embedding(df, text_cols, is_train=True, text_pcas=None, n_components=30):
 
     existing_cols = [c for c in text_cols if c in df.columns]
 
@@ -119,17 +180,30 @@ def text_embedding(df, text_cols, is_train=True, text_pcas=None, n_components=5)
 
     pca_dfs = []
 
+    os.makedirs('embedding_cache', exist_ok=True)
+
     if is_train:
         text_pcas = {}
     elif text_pcas is None:
         raise ValueError("You must pass a fitted 'text_pcas' dictionary when is_train=False")
 
     for col in existing_cols:
-        print(f"[{'TRAIN' if is_train else 'TEST'}] Embedding column: {col}...")
+        split_name = 'train' if is_train else 'test'
 
-        text_data = df[col].fillna('').astype(str).tolist()
+        data_hash = get_data_fingerprint(df[col])
 
-        embeddings = embedder.encode(text_data, show_progress_bar=True, batch_size=32)
+        cache_path = f"embedding_cache/{col}_{split_name}_{data_hash}_embeddings.npy"
+
+        if os.path.exists(cache_path):
+            print(f"[{split_name.upper()}] Loading CACHED embeddings for {col} (Hash: {data_hash})...")
+            embeddings = np.load(cache_path)
+        else:
+            print(f"[{split_name.upper()}] Generating NEW embeddings for {col} (Data changed or no cache)...")
+            text_data = df[col].fillna('').astype(str).tolist()
+            embeddings = embedder.encode(text_data, show_progress_bar=True, batch_size=32)
+            
+            np.save(cache_path, embeddings)
+            print(f"[{split_name.upper()}] Saved new {col} embeddings to cache.")
 
         if is_train:
             pca = PCA(n_components=n_components, random_state=42)
@@ -308,7 +382,7 @@ def release_date(df, date_column='ReleaseDate'):
 def fill_na(df):
     df = df.copy()
 
-    numeric_cols = df.select_dtypes(include=['float64', 'int64']).columns
+    numeric_cols = df.select_dtypes(include=['number']).columns
 
     exclude_cols = ['ReleaseYear', 'ReleaseMonth', 'Game_age'] 
     target_cols = [c for c in numeric_cols if c not in exclude_cols]
@@ -316,7 +390,11 @@ def fill_na(df):
     for col in target_cols:
         if df[col].isna().sum() > 0:
 
-            df[f'{col}_Missing'] = df[col].isna().astype(int)
+            missing_col = f'{col}_Missing'
+
+            if missing_col not in df.columns:
+                df[missing_col] = df[col].isna().astype(int)
+
 
             if df[col].dropna().nunique() <= 2:
                 mode_val = df[col].mode()[0]
